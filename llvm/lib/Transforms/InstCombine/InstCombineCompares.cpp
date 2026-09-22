@@ -77,6 +77,22 @@ static bool hasBranchUse(ICmpInst &I) {
   return false;
 }
 
+/// If replacing Cmp with CmpResult makes a branch edge dead, prefer the fold
+/// when that edge's destination can be removed as well. Folding an edge into a
+/// shared destination can perturb later CFG and loop transforms without
+/// deleting code.
+static bool isProfitableToFoldBranchUse(const ICmpInst &Cmp, bool CmpResult) {
+  if (!Cmp.hasOneUse())
+    return true;
+
+  auto *BI = dyn_cast<CondBrInst>(Cmp.user_back());
+  if (!BI || BI->getParent() != Cmp.getParent())
+    return true;
+
+  unsigned DeadEdge = CmpResult ? 1 : 0;
+  return BI->getSuccessor(DeadEdge)->getSinglePredecessor() == Cmp.getParent();
+}
+
 /// Returns true if the exploded icmp can be expressed as a signed comparison
 /// to zero and updates the predicate accordingly.
 /// The signedness of the comparison is preserved.
@@ -1462,7 +1478,35 @@ Instruction *InstCombinerImpl::foldICmpWithDominatingICmp(ICmpInst &Cmp) {
     }
   }
 
-  return nullptr;
+  // If X were the constant tested here, evaluate the condition of the edge
+  // leading into this block. If that edge would be impossible, the equality
+  // cannot hold. This also handles conditions on simple expressions of X,
+  // which are not indexed by DomConditionCache.
+  if (!Cmp.isEquality())
+    return nullptr;
+
+  BasicBlock *BB = Cmp.getParent();
+  BasicBlock *PredBB = BB->getSinglePredecessor();
+  auto *BI = PredBB ? dyn_cast<CondBrInst>(PredBB->getTerminator()) : nullptr;
+  if (PredBB == BB || !BI || BI->getSuccessor(0) == BI->getSuccessor(1))
+    return nullptr;
+
+  bool TakesTrueEdge = BI->getSuccessor(0) == BB;
+  if (!TakesTrueEdge && BI->getSuccessor(1) != BB)
+    return nullptr;
+
+  Value *Folded = simplifyWithOpReplaced(BI->getCondition(), X, Y,
+                                         SQ.getWithInstruction(BI),
+                                         /*AllowRefinement=*/false);
+  auto *Known = dyn_cast_or_null<ConstantInt>(Folded);
+  if (!Known || Known->isOne() == TakesTrueEdge)
+    return nullptr;
+
+  bool CmpResult = Cmp.getPredicate() == ICmpInst::ICMP_NE;
+  if (!isProfitableToFoldBranchUse(Cmp, CmpResult))
+    return nullptr;
+
+  return replaceInstUsesWith(Cmp, Builder.getInt1(CmpResult));
 }
 
 /// Fold icmp (trunc X), C.
